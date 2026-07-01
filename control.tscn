@@ -1,0 +1,57 @@
+[gd_scene format=3 uid="uid://hir64qkwtu2t"]
+
+[ext_resource type="Texture2D" uid="uid://re0t8lgqfgs8" path="res://icon.svg" id="1_0fbet"]
+[ext_resource type="Script" uid="uid://dmxhfotkhc74x" path="res://MainControl.gd" id="4"]
+
+[sub_resource type="Gradient" id="Gradient_qtu10"]
+offsets = PackedFloat32Array(0, 0.261628, 0.69375, 0.95, 1)
+colors = PackedColorArray(0, 0, 0, 1, 0.525107, 0.38438, 0.668372, 1, 0.898039, 0, 0.219608, 1, 0.94902, 0.960784, 0.337255, 1, 1, 1, 1, 1)
+
+[sub_resource type="LabelSettings" id="LabelSettings_kpl3g"]
+font_size = 74
+
+[node name="Control" type="Control" unique_id=1144403957]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="TextureRect2" type="TextureRect" parent="." unique_id=732588286]
+layout_mode = 0
+offset_left = 35.0
+offset_top = 176.0
+offset_right = 991.0
+offset_bottom = 364.0
+texture = ExtResource("1_0fbet")
+
+[node name="TextureRect" type="TextureRect" parent="." unique_id=52074629]
+layout_mode = 0
+offset_left = 45.0
+offset_top = 421.0
+offset_right = 1001.0
+offset_bottom = 609.0
+texture = ExtResource("1_0fbet")
+
+[node name="Node" type="Node" parent="." unique_id=1239524867 node_paths=PackedStringArray("Render_rect", "Render_rectGD", "Player")]
+script = ExtResource("4")
+Render_rect = NodePath("../TextureRect")
+Render_rectGD = NodePath("../TextureRect2")
+Player = NodePath("../AudioStreamPlayer")
+GRD = SubResource("Gradient_qtu10")
+res = 0.3
+UseGdEditon = true
+use_stereo = true
+
+[node name="AudioStreamPlayer" type="AudioStreamPlayer" parent="." unique_id=453470913]
+
+[node name="Label" type="Label" parent="." unique_id=130370981]
+layout_mode = 0
+offset_left = 56.0
+offset_top = 13.0
+offset_right = 931.0
+offset_bottom = 220.0
+text = "按L打开文件系统
+上GD 下C#"
+label_settings = SubResource("LabelSettings_kpl3g")
