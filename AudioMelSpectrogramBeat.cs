@@ -70,7 +70,7 @@ public partial class AudioMelSpectrogramBeat : RefCounted
 	/// <returns>秒数。占位：beat × 2（等效 120 BPM 匀速）。</returns>
 	private static float BeatToTime(float beat)
 	{
-		return beat * 2f;
+		return beat;
 	}
 
 

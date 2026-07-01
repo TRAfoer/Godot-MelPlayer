@@ -2,11 +2,12 @@ extends RefCounted
 class_name AudioMelSpectrogramGD
 
 # ══════════════════════════════════════════════════════════════
-# 秒数驱动型 Mel 频谱图渲染器 — GDScript 版（直接对标 C# 版）
+# 秒数驱动型 Mel 频谱图渲染器 — GDScript 版
 #
 # ⚠ 注意：GDScript 数值运算速度约为 C# 的 1/50 ~ 1/100。
-#    FFT_SIZE=4096 × 上万帧的总计算量在 GDScript 中可能耗时数分钟。
-#    此脚本供参考/原型验证，生产场景请使用 C# 版本。
+#    此脚本用以下零/微质量损失的优化加速预计算：
+#    - HOP_SIZE=1024（vs C# 版 512）：帧数减半，时间分辨率 23ms/帧（仍 < 肉眼感知）
+#    - 稀疏 Mel + 局部变量缓存 + 内联 PCM 读取
 #
 # === 架构 ===
 # 调用方节点._process()
@@ -14,49 +15,45 @@ class_name AudioMelSpectrogramGD
 #        ├─ 首次检测 AudioStreamWAV → 后台线程预计算全曲 FFT
 #        ├─ 每帧从缓存取出当前可见时间段 → 颜色 LUT → byte[] → 提交 GPU
 #        └─ 视角未变时整帧跳过
-#
-# 后台线程：PCM 读取(主线程) → FFT + Mel 滤波 + Log(子线程) → 缓存 Log 能量
-# 主线程：  按 visibleStart/End 映射到帧范围 → 逐列查 LUT → 写像素 → GPU upload
 # ══════════════════════════════════════════════════════════════
 
 
 # ══════════════════════════════════════════════════════════════
-# [公共参数] 由调用方节点每帧通过字段赋值同步
+# [公共参数]
 # ══════════════════════════════════════════════════════════════
 
-## 渲染目标的 TextureRect。尺寸从此读取 × resolutionScale 决定纹理大小。
 var targetImage: TextureRect
-
-## 纹理分辨率缩放。0.5 = 半分辨率。
 var resolutionScale: float = 0.5
-
-## 颜色渐变：归一化能量 [0,1] → Color。由调用方节点赋值。
 var colorGradient: Gradient
 
 
 # ══════════════════════════════════════════════════════════════
-# [FFT / Mel 常量] 改动需要重新预计算才会生效
+# [FFT / Mel 常量]
+# FFT_SIZE / MEL_BINS 与 C# 版一致，保证质量。
+# HOP_SIZE 提高至 1024：帧数减半 × 计算量减半，时间分辨率 ~23ms 仍 < 视觉感知阈值。
 # ══════════════════════════════════════════════════════════════
 
 const FFT_SIZE: int     = 4096
-const HOP_SIZE: int     = 512
+const HOP_SIZE: int     = 1024          # C# 版为 512；GD 版用 1024 帧数减半，不影响频率分辨率
 const MEL_BINS: int     = 128
 const MEL_A: float      = 2595.0
 const MEL_B: float      = 700.0
-const PROGRESS_INTERVAL: int = 4
+
+## 预计算帧偏移常量，避免每帧/每列重复计算 FFT_SIZE / (2 * HOP_SIZE)
+const FRAME_OFFSET: float = float(FFT_SIZE) / (2.0 * float(HOP_SIZE))
 
 
 # ══════════════════════════════════════════════════════════════
-# [预计算缓存] 后台线程写入 → 主线程只读
+# [预计算缓存]
 # ══════════════════════════════════════════════════════════════
 
-var _cachedWav: AudioStreamWAV               # 当前缓存的 WAV 引用
-var _logMelData: PackedFloat32Array          # 预计算完成的 Log-Mel 缓存
-var _pendingLogData: PackedFloat32Array      # 后台线程正在写入的临时缓存
-var _cacheReady: bool = false                # 后台完成标记
-var _totalFrames: int = 0                    # 总帧数
-var _timePerFrame: float = 0.0               # 每帧时间（秒）
-var _sampleRate: int = 0                     # 采样率
+var _cachedWav: AudioStreamWAV
+var _logMelData: PackedFloat32Array
+var _pendingLogData: PackedFloat32Array
+var _cacheReady: bool = false
+var _totalFrames: int = 0
+var _timePerFrame: float = 0.0
+var _sampleRate: int = 0
 
 # 稀疏 Mel 滤波器
 var _melFilterWeights: Array[PackedFloat32Array] = []
@@ -88,27 +85,24 @@ var _prevEndF: int = 0
 # [颜色 LUT / Bin 查找表]
 # ══════════════════════════════════════════════════════════════
 
-var _colorLut: PackedByteArray               # 256 级颜色 LUT，每项 4 字节 RGBA
-var _appliedGradient: Gradient                # 上次构建 LUT 的 Gradient
-var _binForY: PackedInt32Array                # y → Mel bin 映射
+var _colorLut: PackedByteArray
+var _appliedGradient: Gradient
+var _binForY: PackedInt32Array
 
 
 # ══════════════════════════════════════════════════════════════
 # 每帧入口
 # ══════════════════════════════════════════════════════════════
 
-## 每帧由调用方节点的 _process() 调用。
 func update_view(audioPlayer: AudioStreamPlayer, visibleStart: float, visibleEnd: float, forceUpdate: bool = false) -> void:
 	if targetImage == null:
 		return
 
-	# 检测新 AudioStream → 启动后台预计算
 	if audioPlayer != null and audioPlayer.stream is AudioStreamWAV:
 		var wav: AudioStreamWAV = audioPlayer.stream as AudioStreamWAV
 		if wav != _cachedWav and not _computing:
 			_start_pre_compute(wav)
 
-	# 后台线程完成 → 切缓存
 	if _cacheReady:
 		if _pendingLogData.is_empty():
 			_cacheReady = false
@@ -121,12 +115,10 @@ func update_view(audioPlayer: AudioStreamPlayer, visibleStart: float, visibleEnd
 			_computing = false
 		_pendingLogData = PackedFloat32Array()
 
-	# 完全态：全缓存就绪，正常渲染
 	if not _computing and _logMelData.size() > 0 and _totalFrames > 0:
 		_render_current_view(visibleStart, visibleEnd, forceUpdate)
 		return
 
-	# 部分态：后台计算中，但已有部分帧可供显示
 	if _computing and _pendingLogData.size() > 0 and _framesComputed > 0:
 		_render_current_view(visibleStart, visibleEnd, true, _pendingLogData, _framesComputed)
 
@@ -144,30 +136,22 @@ func _render_current_view(visibleStart: float, visibleEnd: float, forceUpdate: b
 	if data.is_empty() or framesAvail == 0:
 		return
 
-	# 纹理尺寸
 	var size: Vector2 = targetImage.size
 	var w: int = maxi(1, roundi(size.x * resolutionScale))
 	var h: int = maxi(1, roundi(size.y * resolutionScale))
-	var sizeChanged: bool = _texture == null or _texW != w or _texH != h
-
-	if sizeChanged:
+	if _texture == null or _texW != w or _texH != h:
 		_init_texture(w, h)
 
 	var dur: float = visibleEnd - visibleStart
 	if dur <= 0.0:
 		return
 
-	# 节拍范围 → 时间 → FFT 帧范围（用于帧号缓存判断）
-	var curTime: float  = visibleStart
-	var maxTime: float  = visibleEnd
-	var frameOffset: float = float(FFT_SIZE) / (2.0 * float(HOP_SIZE))
-	var startF: int = maxi(0, roundi(curTime / _timePerFrame - frameOffset))
-	var endF: int   = maxi(1, roundi(maxTime / _timePerFrame - frameOffset))
+	var startF: int = maxi(0, roundi(visibleStart / _timePerFrame - FRAME_OFFSET))
+	var endF: int = maxi(1, roundi(visibleEnd / _timePerFrame - FRAME_OFFSET))
 
 	if not forceUpdate and startF == _prevStartF and endF == _prevEndF and _pixels.size() > 0:
 		return
 
-	# 全量重绘
 	_build_color_lut()
 	_render_columns(visibleStart, visibleEnd, w, h, data, framesAvail)
 
@@ -188,45 +172,39 @@ func _render_columns(visibleStart: float, visibleEnd: float,
 		w: int, h: int, data: PackedFloat32Array, totalFrames: int) -> void:
 
 	var timeRange: float = visibleEnd - visibleStart
-	var frameOffset: float = float(FFT_SIZE) / (2.0 * float(HOP_SIZE))
+	var binForY: PackedInt32Array = _binForY
+	var colorLut: PackedByteArray = _colorLut
 
 	for x in w:
-		# 当前列对应的时间 → FFT 帧索引
 		var t: float = float(x) / float(w)
 		var timePos: float = visibleStart + t * timeRange
-		var frameIdx: int = roundi(timePos / _timePerFrame - frameOffset)
+		var frameIdx: int = roundi(timePos / _timePerFrame - FRAME_OFFSET)
 
-		# fillMode：未计算帧用最近已计算帧填充
 		if frameIdx >= totalFrames or frameIdx < 0:
 			frameIdx = clampi(frameIdx, 0, totalFrames - 1)
 
 		var rowBase: int = frameIdx * MEL_BINS
 
-		# 一趟读入 + 扫描 min/max
+		# 一趟读 + 扫描 min/max
 		var mn: float = INF
 		var mx: float = -INF
-		var isValid: bool = false
-		var colVals: PackedFloat32Array = PackedFloat32Array()
-		colVals.resize(h)
-
 		for iy in h:
-			var v: float = data[rowBase + _binForY[iy]]
-			colVals[iy] = v
+			var v: float = data[rowBase + binForY[iy]]
 			if v < mn: mn = v
 			if v > mx: mx = v
 
 		var invRange: float = 1.0 / maxf(mx - mn, 0.001)
 
-		# 从 colVals 查 LUT，逐字节写入 RGBA
+		# 查 LUT 写像素
 		for iy in h:
-			var norm: float = (colVals[iy] - mn) * invRange
+			var norm: float = (data[rowBase + binForY[iy]] - mn) * invRange
 			var idx: int = mini(int(norm * 255.0), 255)
 			var pixelOff: int = (iy * w + x) * 4
 			var lutOff: int = idx * 4
-			_pixels[pixelOff]     = _colorLut[lutOff]
-			_pixels[pixelOff + 1] = _colorLut[lutOff + 1]
-			_pixels[pixelOff + 2] = _colorLut[lutOff + 2]
-			_pixels[pixelOff + 3] = _colorLut[lutOff + 3]
+			_pixels[pixelOff]     = colorLut[lutOff]
+			_pixels[pixelOff + 1] = colorLut[lutOff + 1]
+			_pixels[pixelOff + 2] = colorLut[lutOff + 2]
+			_pixels[pixelOff + 3] = colorLut[lutOff + 3]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -234,7 +212,6 @@ func _render_columns(visibleStart: float, visibleEnd: float,
 # ══════════════════════════════════════════════════════════════
 
 func _start_pre_compute(wav: AudioStreamWAV) -> void:
-	# 立即初始化纹理
 	if targetImage != null:
 		var size: Vector2 = targetImage.size
 		var w: int = maxi(1, roundi(size.x * resolutionScale))
@@ -248,10 +225,8 @@ func _start_pre_compute(wav: AudioStreamWAV) -> void:
 	_sampleRate = int(wav.mix_rate)
 	_timePerFrame = float(HOP_SIZE) / float(_sampleRate)
 
-	# 构建 Mel 滤波器组（主线程）
 	_build_mel_filter_bank()
 
-	# 获取 PCM 基本信息
 	var rawData: PackedByteArray = wav.data
 	var channels: int = 2 if wav.stereo else 1
 	var formatVal: int = int(wav.format)
@@ -266,12 +241,10 @@ func _start_pre_compute(wav: AudioStreamWAV) -> void:
 	var totalSamples: int = rawData.size() / bytesPerSample / channels
 	var totalFrames: int = maxi(1, (totalSamples - FFT_SIZE) / HOP_SIZE + 1)
 
-	# 分配 pending 缓存
 	var pending: PackedFloat32Array = PackedFloat32Array()
 	pending.resize(totalFrames * MEL_BINS)
 	_pendingLogData = pending
 
-	# GDScript 线程：将需要的数据作为参数传递
 	if _thread != null and _thread.is_alive():
 		_thread.wait_to_finish()
 
@@ -287,7 +260,6 @@ func _start_pre_compute(wav: AudioStreamWAV) -> void:
 	_thread.start(_compute_thread_func.bind(args))
 
 
-## 后台线程入口函数（必须用 Dictionary 传参，GDScript 线程约束）。
 func _compute_thread_func(args: Dictionary) -> void:
 	var rawData: PackedByteArray = args["rawData"]
 	var bytesPerSample: int = args["bytesPerSample"]
@@ -296,7 +268,7 @@ func _compute_thread_func(args: Dictionary) -> void:
 	var totalFrames: int = args["totalFrames"]
 	var pending: PackedFloat32Array = args["pending"]
 
-	# 窗函数（所有帧共用）
+	# ── 窗函数（所有帧共用，只算一次）──
 	var window: PackedFloat32Array = PackedFloat32Array()
 	window.resize(FFT_SIZE)
 	var bhA0: float = 0.35875
@@ -315,34 +287,59 @@ func _compute_thread_func(args: Dictionary) -> void:
 	imag.resize(FFT_SIZE)
 	power.resize(FFT_SIZE / 2)
 
+	# 局部化成员变量引用（GDScript 成员访问开销大）
+	var mFS: PackedInt32Array = _melFilterStart
+	var mFE: PackedInt32Array = _melFilterEnd
+	var mFW: Array[PackedFloat32Array] = _melFilterWeights
+	var halfN: int = FFT_SIZE / 2
+
 	for f in totalFrames:
 		if _cancelRequested:
 			return
 
 		var offset: int = f * HOP_SIZE
 
-		# 读 PCM + 混单声道 + 加窗（一趟 pass）
-		for i in FFT_SIZE:
-			var idx: int = offset + i
-			if idx < totalSamples:
-				var sum: float = 0.0
-				for c in channels:
-					var byteOff: int = (idx * channels + c) * bytesPerSample
-					if bytesPerSample == 2 and byteOff + 1 < rawData.size():
-						var s: int = rawData.decode_s16(byteOff)
-						sum += float(s) / 32768.0
-					elif bytesPerSample == 1 and byteOff < rawData.size():
-						sum += float(rawData[byteOff] - 128) / 128.0
-				real[i] = (sum / float(channels)) * window[i]
-			else:
-				real[i] = 0.0
-			imag[i] = 0.0
+		# ── 读 PCM + 混单声道 + 加窗 ──
+		if bytesPerSample == 2 and channels == 2:
+			# 最常用路径：16-bit 立体声 → 内联处理，无内层循环
+			for i in FFT_SIZE:
+				var idx: int = offset + i
+				if idx < totalSamples:
+					var byteOff: int = idx * 4
+					var s0: int = rawData.decode_s16(byteOff)
+					var s1: int = rawData.decode_s16(byteOff + 2)
+					real[i] = ((float(s0) + float(s1)) / 65536.0) * window[i]
+				else:
+					real[i] = 0.0
+				imag[i] = 0.0
+		elif bytesPerSample == 2:
+			# 16-bit 单声道
+			for i in FFT_SIZE:
+				var idx: int = offset + i
+				if idx < totalSamples:
+					var s: int = rawData.decode_s16(idx * 2)
+					real[i] = float(s) / 32768.0 * window[i]
+				else:
+					real[i] = 0.0
+				imag[i] = 0.0
+		else:
+			# 8-bit 通用路径
+			var scale: float = 1.0 / (128.0 * float(channels))
+			for i in FFT_SIZE:
+				var idx: int = offset + i
+				if idx < totalSamples:
+					var sum: float = 0.0
+					for c in channels:
+						sum += float(rawData[idx * channels + c] - 128)
+					real[i] = sum * scale * window[i]
+				else:
+					real[i] = 0.0
+				imag[i] = 0.0
 
 		# 原位 Cooley-Tukey FFT
 		_fft(real, imag)
 
 		# 功率谱 |X|²
-		var halfN: int = FFT_SIZE / 2
 		for i in halfN:
 			power[i] = real[i] * real[i] + imag[i] * imag[i]
 
@@ -350,9 +347,9 @@ func _compute_thread_func(args: Dictionary) -> void:
 		var row: int = f * MEL_BINS
 		for m in MEL_BINS:
 			var e: float = 0.0
-			var s: int = _melFilterStart[m]
-			var eIdx: int = _melFilterEnd[m]
-			var w: PackedFloat32Array = _melFilterWeights[m]
+			var s: int = mFS[m]
+			var eIdx: int = mFE[m]
+			var w: PackedFloat32Array = mFW[m]
 			for i in range(s, eIdx):
 				e += power[i] * w[i - s]
 			pending[row + m] = log(maxf(e, 1e-10))
@@ -363,7 +360,6 @@ func _compute_thread_func(args: Dictionary) -> void:
 			_framesComputed = f + 1
 			_mutex.unlock()
 
-	# 完成后通知主线程
 	_mutex.lock()
 	_pendingLogData = pending
 	_cacheReady = true
@@ -433,7 +429,7 @@ func _build_mel_filter_bank() -> void:
 static func _fft(real: PackedFloat32Array, imag: PackedFloat32Array) -> void:
 	var n: int = real.size()
 
-	# Bit-reversal 重排
+	# Bit-reversal 重排（用 temp var 代替 tuple 避免 GDScript 隐式数组分配）
 	var j: int = 0
 	for i in range(1, n):
 		var bit: int = n >> 1
@@ -449,20 +445,22 @@ static func _fft(real: PackedFloat32Array, imag: PackedFloat32Array) -> void:
 			imag[i] = imag[j]
 			imag[j] = t
 
-	# 蝶形运算
+	# 蝶形运算（预计算 wlenR/wlenI 避免 cos/sin 在循环内重复）
 	var len_: int = 2
 	while len_ <= n:
 		var ang: float = 2.0 * PI / float(len_)
 		var wlenR: float = cos(ang)
 		var wlenI: float = -sin(ang)
 
-		for i in range(0, n, len_):
+		var i: int = 0
+		while i < n:
 			var wr: float = 1.0
 			var wi: float = 0.0
 			var half: int = len_ >> 1
+			var i_end: int = i + half  # 减少重复计算
 			for k in half:
 				var i1: int = i + k
-				var i2: int = i + k + half
+				var i2: int = i1 + half
 				var tr: float = wr * real[i2] - wi * imag[i2]
 				var ti: float = wr * imag[i2] + wi * real[i2]
 				real[i2] = real[i1] - tr
@@ -473,6 +471,7 @@ static func _fft(real: PackedFloat32Array, imag: PackedFloat32Array) -> void:
 				var wI: float = wr * wlenI + wi * wlenR
 				wr = wR
 				wi = wI
+			i += len_
 
 		len_ <<= 1
 
@@ -495,7 +494,6 @@ static func _mel_to_freq(m: float) -> float:
 func _init_texture(w: int, h: int) -> void:
 	_pixels = PackedByteArray()
 	_pixels.resize(w * h * 4)
-	# 初始化为全零（黑色透）
 
 	_image = Image.create_empty(w, h, false, Image.FORMAT_RGBA8)
 	_image.set_data(w, h, false, Image.FORMAT_RGBA8, _pixels)
@@ -505,7 +503,6 @@ func _init_texture(w: int, h: int) -> void:
 	if targetImage != null:
 		targetImage.texture = _texture
 
-	# 预计算 y → bin 索引
 	_binForY = PackedInt32Array()
 	_binForY.resize(h)
 	for y in h:

@@ -7,8 +7,8 @@ var AudioMelSpectrogramBeat=preload("res://AudioMelSpectrogramBeat.cs")
 var AudioDecoder    = preload("res://AudioCodec/AudioDecoder.cs")
 var spec := AudioMelSpectrogram.new()
 var spec1:=AudioMelSpectrogramGD.new()
-
-
+var spec2=AudioMelSpectrogramBeat.new()
+@export var Render_rectBT: TextureRect
 @export var Render_rect: TextureRect
 @export var Render_rectGD: TextureRect
 @export var Player: AudioStreamPlayer
@@ -28,6 +28,9 @@ func _ready() -> void:
 	spec1.targetImage = Render_rectGD
 	spec1.resolutionScale = res
 	spec1.colorGradient = GRD
+	spec2.targetImage = Render_rectBT
+	spec2.resolutionScale = res
+	spec2.colorGradient = GRD
 	spec.targetImage = Render_rect
 	spec.resolutionScale = res
 	spec.colorGradient = GRD
@@ -58,6 +61,8 @@ func _input(event: InputEvent) -> void:
 func _process(_delta: float) -> void:
 	current_time = Player.get_playback_position()
 	spec.UpdateView(Player, current_time, current_time + 5.0, false)
+	spec2.UpdateView(Player, current_time, current_time + 5.0, false)
+
 	if(UseGdEditon):spec1.update_view(Player, current_time, current_time + 5.0, false)
 
 
